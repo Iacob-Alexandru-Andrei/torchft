@@ -6,7 +6,9 @@
 """
 LocalSGD
 =========
-This module implements a fault tolerant version of LocalSGD and related methods.
+This module implements a fault tolerant version of LocalSGD and related methods,
+including Desynchronized Local SGD (DesLoc) and Distributed Local SGD with
+pseudo-gradient averaging (DiLoCo).
 """
 
 import logging
@@ -41,16 +43,6 @@ def extract_local_tensor(t: torch.Tensor) -> torch.Tensor:
         new_tensor = t.clone()
     new_tensor.grad = None
     return new_tensor
-
-
-def _calculate_flat_l2_norm(tensors: list[torch.Tensor]) -> float:
-    """Flattens a list of tensors into a single vector and computes its L2 norm."""
-    if not tensors:
-        return 0.0
-    # Move all tensors to the same device (CPU) for concatenation
-    device = tensors[0].device
-    flat_vector = torch.cat([t.view(-1).to(device) for t in tensors])
-    return torch.linalg.norm(flat_vector).item()
 
 
 class LocalSGD:
@@ -182,14 +174,12 @@ class _ParameterFragment:
         sync_every: int,
         backup_device: torch.device | None,
         pin_memory: bool,
-        debug_mode: bool = True,
     ):
         self._manager = manager
         self._model = model
         self.sync_every = sync_every
         self._backup_device = backup_device
         self._pin_memory = pin_memory
-        self._debug_mode = debug_mode
 
         self._local_step = 0
         self._original_parameters: dict[str, torch.Tensor] = {}
@@ -245,9 +235,6 @@ class _ParameterFragment:
 
     def perform_sync(self) -> None:
         with torch.no_grad():
-            pre_tensors = [p.data.clone() for p in self._model.parameters()]
-            post_tensors = []
-
             for param, avg_param in zip(
                 self._model.parameters(), self._averaged_parameters
             ):
@@ -263,21 +250,6 @@ class _ParameterFragment:
                     )
                 else:
                     param.data.copy_(avg_param)
-                post_tensors.append(param.data)
-            if self._debug_mode:
-                norm_before = _calculate_flat_l2_norm(pre_tensors)
-                norm_after = _calculate_flat_l2_norm(post_tensors)
-
-                flat_before = torch.cat([t.view(-1) for t in pre_tensors])
-                flat_after = torch.cat([t.view(-1) for t in post_tensors])
-                norm_delta = torch.linalg.norm(flat_after - flat_before).item()
-
-                print(
-                    f"DEBUG(Sync): Parameters | "
-                    f"Norm Before: {norm_before:.6f}, "
-                    f"Norm After: {norm_after:.6f}, "
-                    f"Delta Norm: {norm_delta:.6f}"
-                )
 
     def register_state_dict_fn(self) -> None:
         def load_fn(state_dict: dict[str, torch.Tensor]) -> None:
@@ -304,7 +276,6 @@ class _OptimizerStateFragment:
         state_key: str,
         sync_every: int,
         backup_device: torch.device | None,
-        debug_mode: bool = True,  # ADDED: debug_mode parameter
     ):
         self._manager = manager
         self._model = model  # Store the model
@@ -312,7 +283,6 @@ class _OptimizerStateFragment:
         self.state_key = state_key
         self.sync_every = sync_every
         self._backup_device = backup_device
-        self._debug_mode = debug_mode  # ADDED: Store debug_mode
 
         self._local_step = 0
         # FIX: The backup dictionary now uses stable string names as keys
@@ -368,33 +338,12 @@ class _OptimizerStateFragment:
 
     def perform_sync(self) -> None:
         with torch.no_grad():
-            pre_tensors = [
-                self._optimizer.state[self._param_map[name]][self.state_key].clone()
-                for name in self._original_state_tensors
-            ]
-            post_tensors = []
             # The list of names defines the order
             param_names_with_state = list(self._original_state_tensors.keys())
             for i, name in enumerate(param_names_with_state):
                 p = self._param_map[name]
                 self._optimizer.state[p][self.state_key].copy_(
                     self._averaged_state_tensors[i]
-                )
-                post_tensors.append(self._optimizer.state[p][self.state_key])
-
-            if self._debug_mode:
-                norm_before = _calculate_flat_l2_norm(pre_tensors)
-                norm_after = _calculate_flat_l2_norm(post_tensors)
-
-                flat_before = torch.cat([t.view(-1) for t in pre_tensors])
-                flat_after = torch.cat([t.view(-1) for t in post_tensors])
-                norm_delta = torch.linalg.norm(flat_after - flat_before).item()
-
-                print(
-                    f"DEBUG(Sync): Opt State '{self.state_key}' | "
-                    f"Norm Before: {norm_before:.6f}, "
-                    f"Norm After: {norm_after:.6f}, "
-                    f"Delta Norm: {norm_delta:.6f}"
                 )
 
     def register_state_dict_fn(self) -> None:
@@ -415,9 +364,47 @@ class _OptimizerStateFragment:
 
 class DesLoc:
     """
-    Implements a fault-tolerant algorithm for synchronizing model parameters and
-    optimizer states at different frequencies, using a modular fragment architecture
-    with lazy initialization for optimizer states.
+    Implements Desynchronized Local SGD (DesLoc), a fault-tolerant algorithm designed
+    for distributed training. DesLoc decouples the synchronization of model
+    parameters and optimizer states, allowing them to be synchronized at different
+    frequencies. This can improve training efficiency by reducing communication
+    overhead, especially for optimizers with large state tensors (e.g., Adam).
+
+    DesLoc operates as a context manager that wraps a local optimizer. It hooks
+    into the optimizer's `step()` method to track the number of local updates.
+    When the number of steps reaches a predefined threshold for a particular
+    fragment (either parameters or an optimizer state), DesLoc triggers a
+    synchronization for that fragment.
+
+    The synchronization process is fault-tolerant. If a worker fails during the
+    synchronization, the update is discarded, and the model and optimizer states
+    are reverted to their state before the sync began. This ensures that the
+    training process can continue seamlessly with the remaining workers.
+
+    Optimizer states are initialized lazily. DesLoc inspects the optimizer state
+    after the first `step()` call to identify the tensor states that need to be
+    synchronized. This makes it compatible with a wide range of PyTorch optimizers
+    without requiring manual configuration.
+
+    Example:
+        >>> manager = Manager(...)
+        >>> model = MyModel()
+        >>> optimizer = optim.Adam(model.parameters())
+        >>>
+        >>> # Sync parameters every 2 steps, and optimizer states every 4 steps.
+        >>> desloc = DesLoc(
+        ...     manager,
+        ...     model,
+        ...     optimizer,
+        ...     param_sync_every=2,
+        ...     optimizer_sync_every=[4, 4], # For Adam's 'exp_avg' and 'exp_avg_sq'
+        ... )
+        >>>
+        >>> with desloc:
+        ...     for batch in dataloader:
+        ...         # Training loop...
+        ...         optimizer.step()
+
     """
 
     def __init__(
@@ -429,8 +416,22 @@ class DesLoc:
         optimizer_sync_every: list[int],
         backup_device: torch.device | None = None,
         pin_memory: bool = True,
-        debug_mode: bool = True,  # ADDED: debug_mode parameter
     ):
+        """
+        Args:
+            manager: The `Manager` instance to use for coordination.
+            model: The model to be trained.
+            optimizer: The local optimizer.
+            param_sync_every: The frequency (in number of steps) for
+                synchronizing the model parameters.
+            optimizer_sync_every: A list of frequencies (in number of steps) for
+                synchronizing each of the optimizer's tensor states. The order of
+                the frequencies should match the order of the optimizer's states
+                as they are discovered.
+            backup_device: The device to store the backup of parameters and
+                optimizer states. Defaults to CPU.
+            pin_memory: Whether to pin the memory for the backup tensors.
+        """
         if manager._use_async_quorum:
             raise ValueError(
                 "DesLoc requires synchronous quorum. "
@@ -448,9 +449,6 @@ class DesLoc:
         self._opt_sync_every_for_lazy_init = optimizer_sync_every
         self._backup_device_for_lazy_init = backup_device
         self._model_for_lazy_init = model  # You already have this
-        self._debug_mode_for_lazy_init = (
-            debug_mode  # ADDED: Store debug_mode for lazy init
-        )
 
         # Create the parameter fragment immediately.
         param_fragment = _ParameterFragment(
@@ -459,7 +457,6 @@ class DesLoc:
             param_sync_every,
             backup_device,
             pin_memory,
-            debug_mode=debug_mode,
         )
         self._fragments.append(param_fragment)
         param_fragment.register_state_dict_fn()
@@ -504,7 +501,6 @@ class DesLoc:
                 key,
                 self._opt_sync_every_for_lazy_init[i],
                 self._backup_device_for_lazy_init,
-                debug_mode=self._debug_mode_for_lazy_init,
             )
             self._fragments.append(opt_fragment)
             opt_fragment.register_state_dict_fn()
