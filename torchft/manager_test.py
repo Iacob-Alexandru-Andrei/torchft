@@ -14,7 +14,6 @@ from unittest.mock import create_autospec, MagicMock, patch
 
 import torch
 from torch.distributed import ReduceOp, TCPStore
-
 from torchft._torchft import QuorumResult
 from torchft.checkpointing._rwlock import RWLock
 from torchft.checkpointing.transport import CheckpointTransport

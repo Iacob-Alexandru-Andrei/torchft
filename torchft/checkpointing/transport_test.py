@@ -14,7 +14,6 @@ from unittest import TestCase
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DeviceMesh, distribute_tensor, DTensor
-
 from torchft.checkpointing.transport import CheckpointTransport
 
 TIMEOUT_REGEX = r".*(Timed out|timed out|timeout|time out).*"

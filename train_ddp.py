@@ -23,7 +23,6 @@ import torchvision.transforms as transforms
 from torch import nn, optim
 from torch.distributed.elastic.multiprocessing.errors import record
 from torchdata.stateful_dataloader import StatefulDataLoader
-
 from torchft import (
     DistributedDataParallel,
     DistributedSampler,

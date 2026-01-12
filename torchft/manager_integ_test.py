@@ -34,7 +34,6 @@ import torch.distributed as dist
 from parameterized import parameterized
 from torch import nn, optim
 from torch._dynamo.utils import timed
-
 from torchft._torchft import LighthouseServer
 from torchft.ddp import DistributedDataParallel
 from torchft.local_sgd import DiLoCo, LocalSGD

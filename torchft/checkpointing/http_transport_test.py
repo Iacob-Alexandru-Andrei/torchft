@@ -12,7 +12,6 @@ from unittest.mock import MagicMock
 
 import torch
 from parameterized import parameterized
-
 from torchft.checkpointing.http_transport import HTTPTransport
 from torchft.checkpointing.http_transport_bench import main as bench_main
 from torchft.checkpointing.transport import CheckpointTransport

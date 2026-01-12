@@ -56,7 +56,7 @@ def hsdp(
     roles = []
     for replica_id in range(replicas):
         cmd = [
-            f"--master_port={29600+replica_id}",
+            f"--master_port={29600 + replica_id}",
             "--nnodes=1",
             f"--nproc_per_node={workers_per_replica}",
             f"--max_restarts={max_restarts}",

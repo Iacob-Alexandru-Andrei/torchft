@@ -16,7 +16,6 @@ import parameterized
 import torch
 from torch.distributed.distributed_c10d import Work
 from torch.futures import Future
-
 from torchft.manager import _ManagedWork, Manager
 
 

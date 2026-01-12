@@ -10,7 +10,6 @@ from unittest.mock import create_autospec, MagicMock
 import torch
 from torch.nn import Linear
 from torch.optim import AdamW
-
 from torchft.manager import Manager
 from torchft.optim import OptimizerWrapper
 

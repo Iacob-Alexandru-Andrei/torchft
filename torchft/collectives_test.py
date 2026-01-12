@@ -13,7 +13,6 @@ import torch.distributed as dist
 from parameterized import parameterized
 from torch import cuda
 from torch.distributed import ReduceOp, ReduceScatterOptions
-
 from torchft import _test_utils
 from torchft.process_group import ProcessGroup
 from torchft.process_group_test import MultiPgBaseTest

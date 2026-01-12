@@ -17,7 +17,6 @@ from typing import cast, Generator, List, Optional, TypeVar
 
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten, TreeSpec
-
 from torchft.checkpointing._rwlock import RWLock
 from torchft.checkpointing._serialization import _streaming_load, _streaming_save
 from torchft.checkpointing.transport import CheckpointTransport

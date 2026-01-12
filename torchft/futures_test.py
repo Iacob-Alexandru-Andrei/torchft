@@ -11,7 +11,6 @@ from unittest.mock import Mock, patch
 
 import torch
 from torch.futures import Future
-
 from torchft.futures import (
     _TIMEOUT_MANAGER,
     context_timeout,

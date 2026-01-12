@@ -9,7 +9,6 @@ from unittest import skipUnless, TestCase
 import torch
 from parameterized import parameterized
 from torch.distributed import ReduceOp
-
 from torchft import _test_utils
 
 torch.set_printoptions(precision=4, sci_mode=False)

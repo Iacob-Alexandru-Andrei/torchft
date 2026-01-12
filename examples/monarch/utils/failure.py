@@ -13,7 +13,6 @@ from enum import Enum
 from typing import Dict, TYPE_CHECKING
 
 import torch
-
 from monarch.actor import Actor, current_rank, endpoint
 
 logger = logging.getLogger()

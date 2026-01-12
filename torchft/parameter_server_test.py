@@ -8,7 +8,6 @@ from unittest import TestCase
 from unittest.mock import MagicMock
 
 import torch
-
 from torchft.parameter_server import ParameterServer
 from torchft.process_group import ProcessGroup, ProcessGroupGloo
 

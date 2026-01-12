@@ -22,7 +22,6 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.algorithms.join import Joinable
 from torch.nn import parallel
-
 from torchft.process_group import ProcessGroup, ProcessGroupDummy, ProcessGroupGloo
 
 if TYPE_CHECKING:

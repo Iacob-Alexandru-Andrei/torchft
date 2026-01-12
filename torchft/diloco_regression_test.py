@@ -21,7 +21,6 @@ from unittest import skipIf, TestCase
 import torch
 from parameterized import parameterized
 from torch import nn, optim
-
 from torchft._test.diloco_trainer import DiLoCoTrainer, MultiModel
 from torchft._torchft import LighthouseServer
 from torchft.local_sgd import DiLoCo

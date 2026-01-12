@@ -7,7 +7,6 @@
 from unittest import TestCase
 
 from torch.utils.data import Dataset
-
 from torchft.data import DistributedSampler
 
 

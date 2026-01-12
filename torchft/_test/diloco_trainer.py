@@ -13,7 +13,6 @@ from typing import Any, Dict
 import torch
 from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor
-
 from torchft.local_sgd import DiLoCo
 from torchft.manager import Manager
 from torchft.manager_integ_test import MyModel, Runner

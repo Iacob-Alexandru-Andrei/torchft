@@ -31,7 +31,6 @@ import warnings
 from importlib.metadata import version
 
 import pytorch_sphinx_theme2
-
 import torchft
 from docutils import nodes
 from sphinx import addnodes

@@ -12,7 +12,6 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.distributed_c10d import Work
 from torch.futures import Future
-
 from torchft.ddp import DistributedDataParallel, PureDistributedDataParallel
 from torchft.manager import _ManagedWork, Manager
 from torchft.process_group import ProcessGroupBabyGloo, ProcessGroupGloo

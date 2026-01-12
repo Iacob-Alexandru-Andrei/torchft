@@ -9,7 +9,6 @@ from datetime import timedelta
 from unittest import TestCase
 
 import torch.distributed as dist
-
 from torchft import Manager, ProcessGroupGloo
 from torchft._torchft import LighthouseClient, LighthouseServer, Quorum, QuorumMember
 

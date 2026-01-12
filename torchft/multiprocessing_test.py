@@ -2,7 +2,6 @@ from multiprocessing.connection import Connection
 from unittest import TestCase
 
 import torch.multiprocessing as mp
-
 from torchft.multiprocessing import _MonitoredPipe
 
 

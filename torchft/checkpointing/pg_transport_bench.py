@@ -11,7 +11,6 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-
 from torchft.checkpointing.pg_transport import _timeit, PGTransport
 from torchft.process_group import ProcessGroupBabyNCCL
 

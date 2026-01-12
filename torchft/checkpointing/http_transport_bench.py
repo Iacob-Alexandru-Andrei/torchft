@@ -10,7 +10,6 @@ from datetime import timedelta
 from typing import List
 
 import torch
-
 from torchft.checkpointing.http_transport import _time, HTTPTransport
 
 logger: logging.Logger = logging.getLogger(__name__)
