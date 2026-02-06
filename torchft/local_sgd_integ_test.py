@@ -15,7 +15,7 @@ from concurrent.futures import as_completed, ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import field
 from datetime import timedelta
-from typing import Any, cast, Dict
+from typing import Any, cast, Dict, List, Optional
 from unittest import skipIf, TestCase
 
 import torch
@@ -25,7 +25,7 @@ from torch.distributed.pipelining import pipeline, SplitPoint
 from torch.distributed.tensor import DTensor, Replicate
 from torchft._test.diloco_trainer import DiLoCoTrainer, MultiMyModel
 from torchft._torchft import LighthouseServer
-from torchft.local_sgd import DiLoCo, LocalSGD
+from torchft.local_sgd import DESLoc, DiLoCo, LocalSGD
 from torchft.manager import Manager
 from torchft.manager_integ_test import (
     EventInjector,
@@ -41,6 +41,191 @@ from torchft.process_group import (
 
 logger: logging.Logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _ensure_fr_reset_api_for_test() -> None:
+    # Some torch builds used in local CPU test environments don't expose this
+    # Flight Recorder reset API, but Manager currently assumes it exists.
+    c10d = torch._C._distributed_c10d
+    if hasattr(c10d, "_reset_fr_recording_nccl"):
+        return
+    setattr(c10d, "_reset_fr_recording_nccl", lambda: None)
+
+
+def _ensure_cpu_accelerator_api_for_test() -> None:
+    # Some CPU-only torch builds report accelerator availability as true,
+    # which can trigger aborts in torch.accelerator.synchronize().
+    if torch.cuda.is_available():
+        return
+    if not torch.accelerator.is_available():
+        return
+    setattr(torch.accelerator, "is_available", lambda: False)
+    setattr(torch.accelerator, "synchronize", lambda: None)
+
+
+class _DESLocScalarModel(nn.Module):
+    def __init__(self, init_weight: float = 10.0) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.tensor([init_weight, init_weight], dtype=torch.float32)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.weight
+
+
+class _DESLocRecordingOptimizer(optim.Optimizer):
+    def __init__(self, params, lr: float = 1.0) -> None:
+        defaults = {"lr": lr}
+        super().__init__(params, defaults)
+        self.last_local_after_step: Dict[int, torch.Tensor] = {}
+        self.last_state_after_step: Dict[int, Dict[str, torch.Tensor]] = {}
+
+    def step(self, closure=None):  # pyre-ignore[2]
+        del closure
+        self.last_local_after_step = {}
+        self.last_state_after_step = {}
+        for group in self.param_groups:
+            lr = group["lr"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                state = self.state[p]
+                state_a = cast(Optional[torch.Tensor], state.get("state_a"))
+                state_b = cast(Optional[torch.Tensor], state.get("state_b"))
+                if state_a is None:
+                    state_a = torch.zeros_like(p)
+                if state_b is None:
+                    state_b = torch.zeros_like(p)
+
+                grad = p.grad.detach()
+                state_a = state_a + grad
+                state_b = state_b + grad * grad
+                state["state_a"] = state_a
+                state["state_b"] = state_b
+
+                p.data.add_(grad, alpha=-lr)
+                p_id = id(p)
+                self.last_local_after_step[p_id] = p.data.detach().clone()
+                self.last_state_after_step[p_id] = {
+                    "state_a": state_a.detach().clone(),
+                    "state_b": state_b.detach().clone(),
+                }
+
+        return None
+
+
+def desloc_train_loop(
+    rank: int,
+    store_port: int,
+    device: torch.device,
+    runner: Runner,
+    train_loop_args: dict[str, Any] = {},
+) -> Dict[str, object]:
+    _ensure_fr_reset_api_for_test()
+    _ensure_cpu_accelerator_api_for_test()
+    sync_every = int(train_loop_args.get("sync_every", 2))
+    optimizer_sync_every = train_loop_args.get("optimizer_sync_every", None)
+    max_local_steps = int(train_loop_args.get("max_local_steps", 4))
+    replica_grads = cast(dict[int, float], train_loop_args.get("replica_grads", {}))
+    grad_value = float(replica_grads.get(runner.replica_id, 1.0))
+    use_outer_optimizer = bool(train_loop_args.get("use_outer_optimizer", False))
+    outer_lr = float(train_loop_args.get("outer_lr", 1.0))
+
+    with ExitStack() as stack:
+
+        def load_state_dict(state_dict: Dict[str, Dict[str, object]]) -> None:
+            m.load_state_dict(state_dict["model"])
+            optimizer.load_state_dict(state_dict["optim"])
+            if outer_optimizer is not None and "outer_optim" in state_dict:
+                outer_optimizer.load_state_dict(state_dict["outer_optim"])
+
+        def state_dict() -> Dict[str, Dict[str, object]]:
+            payload: Dict[str, Dict[str, object]] = {
+                "model": m.state_dict(),
+                "optim": optimizer.state_dict(),
+            }
+            if outer_optimizer is not None:
+                payload["outer_optim"] = outer_optimizer.state_dict()
+            return payload
+
+        if device.type == "cuda":
+            pg = ProcessGroupBabyNCCL()
+        else:
+            pg = ProcessGroupGloo()
+        manager = Manager(
+            pg=pg,
+            min_replica_size=2,
+            load_state_dict=load_state_dict,
+            state_dict=state_dict,
+            replica_id=str(runner.replica_id),
+            store_addr="localhost",
+            store_port=store_port,
+            rank=rank,
+            world_size=runner.world_size,
+            lighthouse_addr=runner.lighthouse_address,
+            port=19530 + runner.replica_id,
+            timeout=timedelta(seconds=10),
+            quorum_timeout=timedelta(seconds=10),
+            # pyre-fixme[6]: Incompatible parameter type
+            **runner.manager_args,
+        )
+        stack.callback(lambda: manager.shutdown(wait=False))
+
+        m = _DESLocScalarModel().to(device)
+        optimizer = _DESLocRecordingOptimizer(m.parameters(), lr=1.0)
+        outer_optimizer = (
+            optim.SGD(m.parameters(), lr=outer_lr) if use_outer_optimizer else None
+        )
+
+        records: List[Dict[str, float]] = []
+        with DESLoc(
+            manager,
+            m,
+            optimizer,
+            sync_every=sync_every,
+            optimizer_sync_every=optimizer_sync_every,
+            outer_optimizer=outer_optimizer,
+            backup_device=device,
+        ):
+            for local_step in range(1, max_local_steps + 1):
+                m.weight.grad = torch.full_like(m.weight, grad_value)
+                optimizer.step()
+                optimizer.zero_grad()
+
+                p_id = id(m.weight)
+                pre_sync_local_param = optimizer.last_local_after_step[p_id]
+                pre_sync_local_states = optimizer.last_state_after_step[p_id]
+                post_state_a = cast(torch.Tensor, optimizer.state[m.weight]["state_a"])
+                post_state_b = cast(torch.Tensor, optimizer.state[m.weight]["state_b"])
+
+                records.append(
+                    {
+                        "local_step": float(local_step),
+                        "pre_sync_local_param": float(
+                            pre_sync_local_param.detach().cpu()[0].item()
+                        ),
+                        "post_param": float(m.weight.detach().cpu()[0].item()),
+                        "pre_sync_local_state_a": float(
+                            pre_sync_local_states["state_a"].detach().cpu()[0].item()
+                        ),
+                        "post_state_a": float(post_state_a.detach().cpu()[0].item()),
+                        "pre_sync_local_state_b": float(
+                            pre_sync_local_states["state_b"].detach().cpu()[0].item()
+                        ),
+                        "post_state_b": float(post_state_b.detach().cpu()[0].item()),
+                        "manager_step": float(manager.current_step()),
+                    }
+                )
+
+                if manager.current_step() >= 3:
+                    break
+
+                runner.event_injector.check(rank, manager.current_step())
+
+        return {"replica_id": runner.replica_id, "records": records}
+    return {}
 
 
 def local_sgd_train_loop(
@@ -172,6 +357,182 @@ def assert_equal_global_state(
 
 
 class LocalSGDIntegTest(TestCase):
+    def _run_desloc_replicas(self, train_loop_args: dict[str, Any]) -> Dict[int, object]:
+        lighthouse = LighthouseServer(bind="[::]:0", min_replicas=2)
+        num_replicas = 2
+        futures = []
+        results: Dict[int, object] = {}
+
+        with ThreadPoolExecutor(max_workers=num_replicas) as executor:
+            for replica_id in range(num_replicas):
+                runner = Runner(
+                    replica_id=replica_id,
+                    num_replicas=num_replicas,
+                    lighthouse_address=lighthouse.address(),
+                    event_injector=EventInjector(),
+                    train_loop=desloc_train_loop,
+                    use_cuda=False,
+                    manager_args={
+                        "use_async_quorum": False,
+                        # Keep deterministic startup to avoid checkpoint-heal noise
+                        # in pre/post averaging assertions.
+                        "init_sync": False,
+                    },
+                    train_loop_args=train_loop_args,
+                )
+                futures.append(executor.submit(runner.run_replica))
+
+            for fut in as_completed(futures):
+                payload = cast(dict[str, object], fut.result()[0])
+                replica_id = cast(int, payload["replica_id"])
+                results[replica_id] = payload
+
+        lighthouse.shutdown()
+        return results
+
+    def _get_step_record(
+        self, payload: dict[str, object], local_step: int
+    ) -> dict[str, float]:
+        records = cast(list[dict[str, float]], payload["records"])
+        for record in records:
+            if int(record["local_step"]) == local_step:
+                return record
+        raise AssertionError(f"Missing record for local_step={local_step}")
+
+    def test_desloc_param_averaging_pre_post(self) -> None:
+        results = self._run_desloc_replicas(
+            {
+                "sync_every": 2,
+                "optimizer_sync_every": 1000,
+                "max_local_steps": 4,
+                "replica_grads": {
+                    0: 1.0,
+                    1: 3.0,
+                },
+            }
+        )
+
+        rep0 = cast(dict[str, object], results[0])
+        rep1 = cast(dict[str, object], results[1])
+
+        for local_step in [2, 4]:
+            step0 = self._get_step_record(rep0, local_step)
+            step1 = self._get_step_record(rep1, local_step)
+            expected_avg = (
+                step0["pre_sync_local_param"] + step1["pre_sync_local_param"]
+            ) / 2.0
+            self.assertAlmostEqual(step0["post_param"], expected_avg, places=6)
+            self.assertAlmostEqual(step1["post_param"], expected_avg, places=6)
+
+        for local_step in [1, 3]:
+            step0 = self._get_step_record(rep0, local_step)
+            step1 = self._get_step_record(rep1, local_step)
+            self.assertAlmostEqual(
+                step0["post_param"], step0["pre_sync_local_param"], places=6
+            )
+            self.assertAlmostEqual(
+                step1["post_param"], step1["pre_sync_local_param"], places=6
+            )
+
+    def test_desloc_outer_optimizer_averaging_pre_post(self) -> None:
+        results = self._run_desloc_replicas(
+            {
+                "sync_every": 2,
+                "optimizer_sync_every": 1000,
+                "max_local_steps": 4,
+                "use_outer_optimizer": True,
+                "outer_lr": 1.0,
+                "replica_grads": {
+                    0: 1.0,
+                    1: 3.0,
+                },
+            }
+        )
+
+        rep0 = cast(dict[str, object], results[0])
+        rep1 = cast(dict[str, object], results[1])
+
+        for local_step in [2, 4]:
+            step0 = self._get_step_record(rep0, local_step)
+            step1 = self._get_step_record(rep1, local_step)
+            expected_avg = (
+                step0["pre_sync_local_param"] + step1["pre_sync_local_param"]
+            ) / 2.0
+            self.assertAlmostEqual(step0["post_param"], expected_avg, places=6)
+            self.assertAlmostEqual(step1["post_param"], expected_avg, places=6)
+
+        for local_step in [1, 3]:
+            step0 = self._get_step_record(rep0, local_step)
+            step1 = self._get_step_record(rep1, local_step)
+            self.assertAlmostEqual(
+                step0["post_param"], step0["pre_sync_local_param"], places=6
+            )
+            self.assertAlmostEqual(
+                step1["post_param"], step1["pre_sync_local_param"], places=6
+            )
+
+    def test_desloc_optimizer_state_averaging_pre_post(self) -> None:
+        results = self._run_desloc_replicas(
+            {
+                "sync_every": 1000,
+                "optimizer_sync_every": {
+                    "state_a": 2,
+                    "state_b": 4,
+                },
+                "max_local_steps": 4,
+                "replica_grads": {
+                    0: 1.0,
+                    1: 3.0,
+                },
+            }
+        )
+
+        rep0 = cast(dict[str, object], results[0])
+        rep1 = cast(dict[str, object], results[1])
+
+        step2_rep0 = self._get_step_record(rep0, 2)
+        step2_rep1 = self._get_step_record(rep1, 2)
+        expected_state_a_step2 = (
+            step2_rep0["pre_sync_local_state_a"] + step2_rep1["pre_sync_local_state_a"]
+        ) / 2.0
+        self.assertAlmostEqual(step2_rep0["post_state_a"], expected_state_a_step2, places=6)
+        self.assertAlmostEqual(step2_rep1["post_state_a"], expected_state_a_step2, places=6)
+        self.assertAlmostEqual(
+            step2_rep0["post_state_b"], step2_rep0["pre_sync_local_state_b"], places=6
+        )
+        self.assertAlmostEqual(
+            step2_rep1["post_state_b"], step2_rep1["pre_sync_local_state_b"], places=6
+        )
+
+        for local_step in [1, 3]:
+            step0 = self._get_step_record(rep0, local_step)
+            step1 = self._get_step_record(rep1, local_step)
+            self.assertAlmostEqual(
+                step0["post_state_a"], step0["pre_sync_local_state_a"], places=6
+            )
+            self.assertAlmostEqual(
+                step1["post_state_a"], step1["pre_sync_local_state_a"], places=6
+            )
+            self.assertAlmostEqual(
+                step0["post_state_b"], step0["pre_sync_local_state_b"], places=6
+            )
+            self.assertAlmostEqual(
+                step1["post_state_b"], step1["pre_sync_local_state_b"], places=6
+            )
+
+        step4_rep0 = self._get_step_record(rep0, 4)
+        step4_rep1 = self._get_step_record(rep1, 4)
+        expected_state_a_step4 = (
+            step4_rep0["pre_sync_local_state_a"] + step4_rep1["pre_sync_local_state_a"]
+        ) / 2.0
+        expected_state_b_step4 = (
+            step4_rep0["pre_sync_local_state_b"] + step4_rep1["pre_sync_local_state_b"]
+        ) / 2.0
+        self.assertAlmostEqual(step4_rep0["post_state_a"], expected_state_a_step4, places=6)
+        self.assertAlmostEqual(step4_rep1["post_state_a"], expected_state_a_step4, places=6)
+        self.assertAlmostEqual(step4_rep0["post_state_b"], expected_state_b_step4, places=6)
+        self.assertAlmostEqual(step4_rep1["post_state_b"], expected_state_b_step4, places=6)
+
     # TODO: race condition due to using NCCL in threads causes manager allreduce to sometimes not be correct
     # Because of that the test is disabled for cuda
     @parameterized.expand(

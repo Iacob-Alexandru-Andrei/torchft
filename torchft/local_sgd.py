@@ -14,7 +14,7 @@ import math
 import os
 from contextlib import nullcontext
 from types import TracebackType
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
 
 import torch
 from torch import nn, optim
@@ -40,6 +40,41 @@ def extract_local_tensor(t: torch.Tensor) -> torch.Tensor:
         new_tensor = t.clone()
     new_tensor.grad = None
     return new_tensor
+
+
+def _copy_parameter_from_local(param: torch.Tensor, value: torch.Tensor) -> None:
+    if isinstance(param, DTensor):
+        param.data.copy_(
+            DTensor.from_local(
+                value,
+                param.device_mesh,
+                param.placements,
+                shape=param.shape,
+                stride=param.stride(),
+            )
+        )
+    else:
+        param.data.copy_(value)
+
+
+def _set_parameter_grad_from_local(param: torch.Tensor, grad: torch.Tensor) -> None:
+    if isinstance(param, DTensor):
+        param.grad = DTensor.from_local(
+            grad,
+            param.device_mesh,
+            param.placements,
+            shape=param.shape,
+            stride=param.stride(),
+        )
+    else:
+        param.grad = grad
+
+
+def _zero_optimizer_grads(optimizer: optim.Optimizer) -> None:
+    try:
+        optimizer.zero_grad(set_to_none=True)
+    except TypeError:
+        optimizer.zero_grad()
 
 
 class LocalSGD:
@@ -170,6 +205,324 @@ class LocalSGD:
         for work in works:
             work.wait()
         return averaged_parameters
+
+
+class DESLoc:
+    """
+    DESLoc synchronizes parameters and optimizer states at independent frequencies.
+
+    Parameters are synchronized every ``sync_every`` steps with either:
+    - LocalSGD averaging when ``outer_optimizer`` is None
+    - DiLoCo-style pseudo-gradient updates when ``outer_optimizer`` is provided
+
+    Optimizer states are discovered dynamically and synchronized according to
+    ``optimizer_sync_every``.
+    """
+
+    def __init__(
+        self,
+        manager: Manager,
+        model: nn.Module,
+        optimizer: optim.Optimizer,
+        sync_every: int,
+        optimizer_sync_every: Optional[Union[int, Dict[str, int]]] = None,
+        outer_optimizer: Optional[optim.Optimizer] = None,
+        backup_device: Optional[torch.device] = None,
+        pin_memory: bool = True,
+    ) -> None:
+        assert sync_every >= 1, "sync_every must be greater than or equal to 1"
+        self._validate_optimizer_sync_every(optimizer_sync_every)
+
+        self._manager = manager
+        self._model = model
+        self._local_optimizer = optimizer
+        self._outer_optimizer = outer_optimizer
+        self._sync_every = sync_every
+        self._optimizer_sync_every = optimizer_sync_every
+        self._backup_device = backup_device
+        self._pin_memory = pin_memory
+
+        self._local_step = 0
+        self._hooks: List[RemovableHandle] = []
+
+        self._optimizer_state_sync_every: Dict[str, int] = {}
+        self._optimizer_state_steps: Dict[str, int] = {}
+
+        self._reference_parameters: Dict[str, torch.Tensor] = {}
+        self._outer_optimizer_param_ids: Set[int] = set()
+        if self._outer_optimizer is not None:
+            self._init_reference_parameters()
+            self._save_reference_parameters()
+            self._register_state_dict_fn()
+            for group in self._outer_optimizer.param_groups:
+                for p in group["params"]:
+                    self._outer_optimizer_param_ids.add(id(p))
+
+    def __enter__(self) -> "DESLoc":
+        self._hooks.append(
+            self._local_optimizer.register_step_pre_hook(self._step_pre_hook)
+        )
+        self._hooks.append(
+            self._local_optimizer.register_step_post_hook(self._step_post_hook)
+        )
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> bool:
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+        return False
+
+    def _step_pre_hook(
+        self, _optim: optim.Optimizer, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]
+    ) -> None:
+        self._manager.disallow_state_dict_read()
+
+    def _step_post_hook(
+        self, _optim: optim.Optimizer, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]
+    ) -> None:
+        self._manager.allow_state_dict_read()
+
+        self._local_step += 1
+        self._discover_optimizer_state_keys()
+        due_state_keys = self._due_state_keys()
+        should_sync_params = self._local_step >= self._sync_every
+        if not should_sync_params and not due_state_keys:
+            return
+
+        self._manager.start_quorum()
+        works: List[Work] = []
+        averaged_parameters: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        averaged_pseudogradients: List[
+            Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
+
+        if should_sync_params:
+            if self._outer_optimizer is None:
+                averaged_parameters = self._prepare_parameter_average(works)
+            else:
+                averaged_pseudogradients = self._prepare_pseudogradients(works)
+
+        averaged_state_tensors = self._prepare_optimizer_state_sync(
+            due_state_keys, works
+        )
+
+        for work in works:
+            work.wait()
+
+        if self._manager.should_commit():
+            if should_sync_params:
+                if self._outer_optimizer is None:
+                    self._commit_parameter_average(averaged_parameters)
+                else:
+                    self._commit_pseudogradient_step(averaged_pseudogradients)
+
+            self._commit_optimizer_state_sync(averaged_state_tensors)
+        elif should_sync_params and self._outer_optimizer is not None:
+            self._restore_reference_parameters()
+            _zero_optimizer_grads(self._outer_optimizer)
+
+        if should_sync_params:
+            self._local_step = 0
+        for key in due_state_keys:
+            self._optimizer_state_steps[key] = 0
+
+    def _validate_optimizer_sync_every(
+        self, optimizer_sync_every: Optional[Union[int, Dict[str, int]]]
+    ) -> None:
+        if optimizer_sync_every is None:
+            return
+        if isinstance(optimizer_sync_every, int):
+            if optimizer_sync_every < 1:
+                raise ValueError(
+                    "optimizer_sync_every must be greater than or equal to 1"
+                )
+            return
+        if isinstance(optimizer_sync_every, dict):
+            for interval in optimizer_sync_every.values():
+                if int(interval) < 1:
+                    raise ValueError(
+                        "optimizer_sync_every values must be greater than or equal to 1"
+                    )
+            return
+        raise TypeError("optimizer_sync_every must be an int, dict, or None")
+
+    def _resolve_state_sync_every(self, key: str) -> int:
+        if self._optimizer_sync_every is None:
+            return self._sync_every
+        if isinstance(self._optimizer_sync_every, int):
+            return self._optimizer_sync_every
+        return int(self._optimizer_sync_every.get(key, self._sync_every))
+
+    def _discover_optimizer_state_keys(self) -> None:
+        discovered_keys: Set[str] = set()
+        for state in self._local_optimizer.state.values():
+            for key, value in state.items():
+                if (
+                    isinstance(value, torch.Tensor)
+                    and torch.is_floating_point(value)
+                    and value.numel() > 1
+                ):
+                    discovered_keys.add(str(key))
+
+        for key in sorted(discovered_keys):
+            if key in self._optimizer_state_sync_every:
+                continue
+            self._optimizer_state_sync_every[key] = self._resolve_state_sync_every(key)
+            self._optimizer_state_steps[key] = 0
+
+    def _due_state_keys(self) -> List[str]:
+        due: List[str] = []
+        for key in sorted(self._optimizer_state_steps.keys()):
+            self._optimizer_state_steps[key] += 1
+            if self._optimizer_state_steps[key] >= self._optimizer_state_sync_every[key]:
+                due.append(key)
+        return due
+
+    def _prepare_parameter_average(
+        self, works: List[Work]
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        averaged_parameters: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for param in self._model.parameters():
+            averaged = extract_local_tensor(param.data)
+            works.append(self._manager.allreduce(averaged))
+            averaged_parameters.append((param, averaged))
+        return averaged_parameters
+
+    def _commit_parameter_average(
+        self, averaged_parameters: List[Tuple[torch.Tensor, torch.Tensor]]
+    ) -> None:
+        with torch.no_grad():
+            for param, averaged in averaged_parameters:
+                _copy_parameter_from_local(param, averaged)
+
+    def _prepare_pseudogradients(
+        self, works: List[Work]
+    ) -> List[Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        averaged_pseudogradients: List[
+            Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
+        for name, param in self._model.named_parameters():
+            local_param = extract_local_tensor(param.data)
+            reference_param = self._reference_parameters[name].to(
+                device=local_param.device,
+                dtype=local_param.dtype,
+            )
+            pseudograd = reference_param - local_param
+            works.append(self._manager.allreduce(pseudograd))
+            averaged_pseudogradients.append((name, param, pseudograd, reference_param))
+        return averaged_pseudogradients
+
+    def _commit_pseudogradient_step(
+        self,
+        averaged_pseudogradients: List[
+            Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor]
+        ],
+    ) -> None:
+        assert self._outer_optimizer is not None
+        with torch.no_grad():
+            for _, param, _, reference_param in averaged_pseudogradients:
+                _copy_parameter_from_local(param, reference_param)
+
+            should_step_outer = False
+            for _, param, pseudograd, reference_param in averaged_pseudogradients:
+                if id(param) in self._outer_optimizer_param_ids:
+                    should_step_outer = True
+                    _set_parameter_grad_from_local(param, pseudograd)
+                    continue
+
+                averaged_param = reference_param - pseudograd
+                _copy_parameter_from_local(param, averaged_param)
+
+        if should_step_outer:
+            self._outer_optimizer.step()
+        _zero_optimizer_grads(self._outer_optimizer)
+        self._save_reference_parameters()
+
+    def _prepare_optimizer_state_sync(
+        self, due_state_keys: List[str], works: List[Work]
+    ) -> Dict[str, List[Tuple[torch.Tensor, torch.Tensor]]]:
+        averaged_state_tensors: Dict[str, List[Tuple[torch.Tensor, torch.Tensor]]] = {}
+        for key in due_state_keys:
+            synced_tensors: List[Tuple[torch.Tensor, torch.Tensor]] = []
+            for state in self._local_optimizer.state.values():
+                value = state.get(key)
+                if (
+                    isinstance(value, torch.Tensor)
+                    and torch.is_floating_point(value)
+                    and value.numel() > 1
+                ):
+                    averaged_state = value.detach().clone()
+                    works.append(self._manager.allreduce(averaged_state))
+                    synced_tensors.append((value, averaged_state))
+            if synced_tensors:
+                averaged_state_tensors[key] = synced_tensors
+        return averaged_state_tensors
+
+    def _commit_optimizer_state_sync(
+        self, averaged_state_tensors: Dict[str, List[Tuple[torch.Tensor, torch.Tensor]]]
+    ) -> None:
+        with torch.no_grad():
+            for synced_tensors in averaged_state_tensors.values():
+                for state_tensor, averaged_state in synced_tensors:
+                    state_tensor.copy_(averaged_state)
+
+    def _init_reference_parameters(self) -> None:
+        for name, param in self._model.named_parameters():
+            p = extract_local_tensor(param.data)
+            backup_device = self._backup_device or torch.device("cpu")
+            reference = torch.empty(*tuple(p.shape), dtype=p.dtype, device=backup_device)
+            if (
+                self._pin_memory
+                and reference.device == torch.device("cpu")
+                and torch.cuda.is_available()
+            ):
+                reference = reference.pin_memory()
+            self._reference_parameters[name] = reference
+
+    def _save_reference_parameters(self) -> None:
+        with torch.no_grad():
+            for name, param in self._model.named_parameters():
+                value = extract_local_tensor(param.data)
+                self._reference_parameters[name].copy_(value, non_blocking=True)
+
+    def _restore_reference_parameters(self) -> None:
+        with torch.no_grad():
+            for name, param in self._model.named_parameters():
+                _copy_parameter_from_local(param, self._reference_parameters[name])
+
+    def _register_state_dict_fn(self) -> None:
+        assert self._outer_optimizer is not None
+
+        def load_fn(state_dict: Dict[str, Any]) -> None:
+            if not state_dict:
+                self._save_reference_parameters()
+                return
+
+            reference_parameters = state_dict.get("reference_parameters", state_dict)
+            for name, value in reference_parameters.items():
+                if name in self._reference_parameters:
+                    self._reference_parameters[name].copy_(value)
+
+            outer_optimizer = state_dict.get("outer_optimizer")
+            if outer_optimizer is not None:
+                self._outer_optimizer.load_state_dict(outer_optimizer)
+
+        def save_fn() -> Dict[str, Any]:
+            return {
+                "outer_optimizer": self._outer_optimizer.state_dict(),
+                "reference_parameters": {
+                    name: extract_local_tensor(param)
+                    for name, param in self._reference_parameters.items()
+                },
+            }
+
+        self._manager.register_state_dict_fn("DESLoc", load_fn, save_fn)
 
 
 class _StreamingDiLoCoFragment:
