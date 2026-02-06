@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Dict
+from typing import Dict, Set
 from unittest import TestCase
 from unittest.mock import create_autospec, MagicMock
 
@@ -13,7 +13,7 @@ from parameterized import parameterized
 from torch import nn, optim, Tensor
 from torch.distributed.distributed_c10d import Work
 from torch.distributed.tensor import DTensor
-from torchft.local_sgd import DiLoCo, extract_local_tensor, LocalSGD
+from torchft.local_sgd import DESLoc, DiLoCo, extract_local_tensor, LocalSGD
 from torchft.manager import Manager
 from torchft.work import _DummyWork
 
@@ -93,13 +93,13 @@ class LocalSGDTest(TestCase):
             self.assertEqual(manager.allreduce.call_count, 4)
 
     def test_extract_local_tensor(self) -> None:
-        regular_tensor = torch.rand(3, 3, requires_grad=True)
+        regular_tensor = torch.rand(3, 3)
         regular_result = extract_local_tensor(regular_tensor)
 
         self.assertTrue(torch.equal(regular_result, regular_tensor))
         self.assertIsNone(regular_result.grad)
         self.assertNotEqual(id(regular_result), id(regular_tensor))
-        local_tensor = torch.rand(3, 3, requires_grad=True)
+        local_tensor = torch.rand(3, 3)
         dtensor = MagicMock(spec=DTensor)
         dtensor.to_local.return_value = local_tensor
         dtensor_result = extract_local_tensor(dtensor)
@@ -321,3 +321,151 @@ class DiLoCoTest(TestCase):
             t = torch.empty_like(param.grad)
             t.fill_(expected_grad)
             torch.testing.assert_close(param.grad, t)
+
+
+class DESLocTest(TestCase):
+    def _train_step(self, model: nn.Module, optimizer: optim.Optimizer) -> None:
+        inp = torch.rand(2, 3)
+        loss = model(inp).mean()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    def _float_state_keys(self, optimizer: optim.Optimizer) -> Set[str]:
+        keys: Set[str] = set()
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if (
+                    isinstance(value, torch.Tensor)
+                    and torch.is_floating_point(value)
+                    and value.numel() > 1
+                ):
+                    keys.add(str(key))
+        return keys
+
+    def test_desloc_discovers_state_keys_dynamically(self) -> None:
+        model = SimpleModel()
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+        manager = create_manager()
+
+        with DESLoc(manager, model, optimizer, sync_every=1000) as desloc:
+            self._train_step(model, optimizer)
+            expected_state_keys = self._float_state_keys(optimizer)
+            self.assertGreater(len(expected_state_keys), 0)
+            self.assertEqual(
+                set(desloc._optimizer_state_sync_every.keys()),
+                expected_state_keys,
+            )
+
+    def test_desloc_per_key_frequency_sync(self) -> None:
+        model = SimpleModel()
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+        manager = create_manager()
+        manager.should_commit.return_value = True
+
+        with DESLoc(
+            manager,
+            model,
+            optimizer,
+            sync_every=1000,
+            optimizer_sync_every={"exp_avg": 2, "exp_avg_sq": 4},
+        ):
+            for _ in range(4):
+                self._train_step(model, optimizer)
+
+            state_param_count = len(optimizer.state)
+            self.assertEqual(manager.start_quorum.call_count, 2)
+            self.assertEqual(manager.allreduce.call_count, state_param_count * 3)
+
+    def test_desloc_dict_missing_key_falls_back_to_sync_every(self) -> None:
+        model = SimpleModel()
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+        manager = create_manager()
+
+        with DESLoc(
+            manager,
+            model,
+            optimizer,
+            sync_every=7,
+            optimizer_sync_every={"exp_avg": 2},
+        ) as desloc:
+            self._train_step(model, optimizer)
+            self.assertEqual(desloc._optimizer_state_sync_every["exp_avg"], 2)
+            self.assertEqual(desloc._optimizer_state_sync_every["exp_avg_sq"], 7)
+
+    def test_desloc_outer_optimizer_commit_false_rolls_back_params(self) -> None:
+        model = TinyModel()
+        inner_optimizer = optim.SGD(model.parameters(), lr=1.0)
+        outer_optimizer = optim.SGD(model.parameters(), lr=0.5)
+        manager = create_manager()
+        manager.should_commit.return_value = False
+
+        with DESLoc(
+            manager,
+            model,
+            inner_optimizer,
+            sync_every=1,
+            outer_optimizer=outer_optimizer,
+        ):
+            initial_state = _copy_state_dict(model.state_dict())
+            for param in model.parameters():
+                param.grad = torch.ones_like(param)
+            inner_optimizer.step()
+
+            for name, param in model.state_dict().items():
+                torch.testing.assert_close(param, initial_state[name])
+
+    def test_desloc_outer_optimizer_commit_true_updates_reference(self) -> None:
+        model = TinyModel()
+        inner_optimizer = optim.SGD(model.parameters(), lr=1.0)
+        outer_optimizer = optim.SGD(model.parameters(), lr=0.5)
+        manager = create_manager()
+        manager.should_commit.return_value = True
+
+        with DESLoc(
+            manager,
+            model,
+            inner_optimizer,
+            sync_every=1,
+            outer_optimizer=outer_optimizer,
+        ) as desloc:
+            initial_state = _copy_state_dict(model.state_dict())
+            for param in model.parameters():
+                param.grad = torch.ones_like(param)
+            inner_optimizer.step()
+
+            expected_state = {
+                name: value - 0.5 for name, value in initial_state.items()
+            }
+            for name, param in model.state_dict().items():
+                torch.testing.assert_close(param, expected_state[name])
+
+            for name, reference in desloc._reference_parameters.items():
+                torch.testing.assert_close(reference, expected_state[name])
+
+    def test_desloc_float_tensor_filter(self) -> None:
+        model = TinyModel()
+        optimizer = optim.SGD(model.parameters(), lr=0.1)
+        manager = create_manager()
+
+        for param in model.parameters():
+            optimizer.state[param]["float_vector"] = torch.ones_like(param)
+            optimizer.state[param]["float_scalar"] = torch.tensor(1.0)
+            optimizer.state[param]["int_vector"] = torch.ones_like(
+                param, dtype=torch.int64
+            )
+
+        with DESLoc(
+            manager,
+            model,
+            optimizer,
+            sync_every=1000,
+            optimizer_sync_every=2,
+        ) as desloc:
+            for param in model.parameters():
+                param.grad = torch.ones_like(param)
+            optimizer.step()
+
+            self.assertIn("float_vector", desloc._optimizer_state_sync_every)
+            self.assertNotIn("float_scalar", desloc._optimizer_state_sync_every)
+            self.assertNotIn("int_vector", desloc._optimizer_state_sync_every)
