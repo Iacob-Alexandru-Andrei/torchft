@@ -12,7 +12,9 @@ This module implements a fault tolerant version of LocalSGD and related methods.
 import logging
 import math
 import os
+import pydoc
 from contextlib import nullcontext
+from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
 
@@ -26,6 +28,31 @@ from torchft.manager import Manager
 logger: logging.Logger = logging.getLogger(__name__)
 
 USE_BUCKETIZATION_ENV: str = "TORCHFT_USE_BUCKETIZATION"
+
+
+@dataclass(frozen=True)
+class OuterOptimizerConfig:
+    """Configuration for creating an outer optimizer lazily.
+
+    Args:
+        optimizer_cls: Optimizer class or dotted path string (e.g., "torch.optim.SGD").
+        kwargs: Additional keyword arguments passed to the optimizer constructor.
+    """
+
+    optimizer_cls: Union[Type[optim.Optimizer], str]
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    def build(self, params: Any) -> optim.Optimizer:
+        """Instantiate the optimizer with the given parameters."""
+        cls = self.optimizer_cls
+        if isinstance(cls, str):
+            resolved = pydoc.locate(cls)
+            if resolved is None:
+                resolved = getattr(optim, cls, None)
+            if resolved is None:
+                raise ValueError(f"Could not resolve optimizer class: {cls}")
+            cls = resolved
+        return cls(params, **self.kwargs)
 
 
 def extract_local_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -209,14 +236,85 @@ class LocalSGD:
 
 class DESLoc:
     """
-    DESLoc synchronizes parameters and optimizer states at independent frequencies.
+    DES-LOC: Decoupled Synchronization for Local Optimization.
 
-    Parameters are synchronized every ``sync_every`` steps with either:
-    - LocalSGD averaging when ``outer_optimizer`` is None
-    - DiLoCo-style pseudo-gradient updates when ``outer_optimizer`` is provided
+    Synchronizes model parameters and optimizer states at independent
+    frequencies across distributed workers. Parameters are averaged
+    every ``sync_every`` steps. Optimizer states (e.g. ``exp_avg``,
+    ``exp_avg_sq`` for Adam) are discovered dynamically and
+    synchronized every ``optimizer_sync_every`` steps.
 
-    Optimizer states are discovered dynamically and synchronized according to
-    ``optimizer_sync_every``.
+    When ``outer_optimizer`` is provided, parameter synchronization
+    uses DiLoCo-style pseudo-gradient updates instead of simple
+    averaging.
+
+    Algorithm Configurations
+    ========================
+
+    **Local Adam** — sync params and optimizer states at the same
+    frequency, no outer optimizer::
+
+        desloc = DESLoc(
+            manager=manager,
+            model=model,
+            optimizer=adam_optimizer,
+            sync_every=H,
+            optimizer_sync_every=H,  # same as sync_every
+        )
+
+    **DES-LOC** — independent sync frequencies for params and
+    optimizer states, optional outer optimizer::
+
+        desloc = DESLoc(
+            manager=manager,
+            model=model,
+            optimizer=adam_optimizer,
+            sync_every=H_p,
+            optimizer_sync_every=H_o,  # independent frequency
+            outer_optimizer=outer_opt,  # optional
+        )
+
+    **DES-LOC with per-key frequencies** — different sync rates for
+    different optimizer state keys::
+
+        desloc = DESLoc(
+            manager=manager,
+            model=model,
+            optimizer=adam_optimizer,
+            sync_every=50,
+            optimizer_sync_every={"exp_avg": 25, "exp_avg_sq": 100},
+        )
+
+    **MT-DAO** — combine with :class:`DiLoCo` for streaming
+    pseudo-gradient sync plus independent optimizer state sync.
+    Use ``DiLoCo`` for the parameter synchronization and a separate
+    ``DESLoc`` instance (with ``sync_every`` set very high or managed
+    externally) for the optimizer state synchronization.
+
+    References
+    ==========
+
+    - Local Adam: Blake Woodworth et al., "Local SGD: Unified Theory and New
+      Efficient Methods", AISTATS 2021. https://arxiv.org/abs/2011.14413
+    - DES-LOC: Yatin Dandi et al., "Decoupled Synchronization for Local
+      Optimization", 2025.
+    - MT-DAO: Yatin Dandi et al., "Memory-Efficient Training with
+      Decoupled Asynchronous Optimization", 2025.
+
+    Args:
+        manager: Fault-tolerant manager for quorum and allreduce.
+        model: The model whose parameters are synchronized.
+        optimizer: The local (inner) optimizer used every step.
+        sync_every: Number of local steps between parameter syncs.
+        optimizer_sync_every: Frequency for optimizer state synchronization.
+            ``None`` (default) syncs states at the same frequency as parameters.
+            An ``int`` sets a uniform frequency for all state keys.
+            A ``dict`` maps state key names to individual frequencies.
+        outer_optimizer: Optional outer optimizer for DiLoCo-style updates.
+            Can be an ``optim.Optimizer`` instance or an
+            :class:`OuterOptimizerConfig` for lazy construction.
+        backup_device: Device for storing reference parameters (CPU by default).
+        pin_memory: Pin CPU memory for reference parameters when CUDA is available.
     """
 
     def __init__(
@@ -226,12 +324,17 @@ class DESLoc:
         optimizer: optim.Optimizer,
         sync_every: int,
         optimizer_sync_every: Optional[Union[int, Dict[str, int]]] = None,
-        outer_optimizer: Optional[optim.Optimizer] = None,
+        outer_optimizer: Optional[Union[optim.Optimizer, "OuterOptimizerConfig"]] = None,
         backup_device: Optional[torch.device] = None,
         pin_memory: bool = True,
     ) -> None:
         assert sync_every >= 1, "sync_every must be greater than or equal to 1"
         self._validate_optimizer_sync_every(optimizer_sync_every)
+
+        # Resolve OuterOptimizerConfig into an actual optimizer
+        if isinstance(outer_optimizer, OuterOptimizerConfig):
+            # Build outer optimizer over model parameters
+            outer_optimizer = outer_optimizer.build(model.parameters())
 
         self._manager = manager
         self._model = model

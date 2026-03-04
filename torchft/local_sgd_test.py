@@ -13,7 +13,13 @@ from parameterized import parameterized
 from torch import nn, optim, Tensor
 from torch.distributed.distributed_c10d import Work
 from torch.distributed.tensor import DTensor
-from torchft.local_sgd import DESLoc, DiLoCo, extract_local_tensor, LocalSGD
+from torchft.local_sgd import (
+    DESLoc,
+    DiLoCo,
+    extract_local_tensor,
+    LocalSGD,
+    OuterOptimizerConfig,
+)
 from torchft.manager import Manager
 from torchft.work import _DummyWork
 
@@ -469,3 +475,115 @@ class DESLocTest(TestCase):
             self.assertIn("float_vector", desloc._optimizer_state_sync_every)
             self.assertNotIn("float_scalar", desloc._optimizer_state_sync_every)
             self.assertNotIn("int_vector", desloc._optimizer_state_sync_every)
+
+    def test_desloc_outer_optimizer_config_builds_optimizer(self) -> None:
+        model = SimpleModel()
+        inner_optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+        manager = create_manager()
+
+        config = OuterOptimizerConfig(
+            optimizer_cls=optim.SGD, kwargs={"lr": 0.1, "momentum": 0.9}
+        )
+
+        with DESLoc(
+            manager,
+            model,
+            inner_optimizer,
+            sync_every=10,
+            outer_optimizer=config,
+        ) as desloc:
+            self.assertIsInstance(desloc._outer_optimizer, optim.SGD)
+            self.assertGreater(len(desloc._reference_parameters), 0)
+
+    def test_desloc_outer_optimizer_config_string_resolution(self) -> None:
+        model = SimpleModel()
+        inner_optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+        manager = create_manager()
+
+        config = OuterOptimizerConfig(optimizer_cls="SGD", kwargs={"lr": 0.01})
+
+        with DESLoc(
+            manager,
+            model,
+            inner_optimizer,
+            sync_every=10,
+            outer_optimizer=config,
+        ) as desloc:
+            self.assertIsInstance(desloc._outer_optimizer, optim.SGD)
+
+    def test_desloc_outer_optimizer_config_dotted_path(self) -> None:
+        model = SimpleModel()
+        inner_optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+        manager = create_manager()
+
+        config = OuterOptimizerConfig(
+            optimizer_cls="torch.optim.Adam", kwargs={"lr": 0.001}
+        )
+
+        with DESLoc(
+            manager,
+            model,
+            inner_optimizer,
+            sync_every=10,
+            outer_optimizer=config,
+        ) as desloc:
+            self.assertIsInstance(desloc._outer_optimizer, optim.Adam)
+
+    def test_desloc_outer_optimizer_config_invalid_string(self) -> None:
+        model = SimpleModel()
+        inner_optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+        manager = create_manager()
+
+        config = OuterOptimizerConfig(optimizer_cls="NonExistentOptimizer123")
+
+        with self.assertRaises(ValueError) as ctx:
+            DESLoc(
+                manager,
+                model,
+                inner_optimizer,
+                sync_every=10,
+                outer_optimizer=config,
+            )
+        self.assertIn("Could not resolve", str(ctx.exception))
+
+    def test_desloc_outer_optimizer_config_backward_compat(self) -> None:
+        model = SimpleModel()
+        inner_optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+        outer_optimizer = optim.SGD(model.parameters(), lr=0.1)
+        manager = create_manager()
+
+        with DESLoc(
+            manager,
+            model,
+            inner_optimizer,
+            sync_every=10,
+            outer_optimizer=outer_optimizer,
+        ) as desloc:
+            self.assertIs(desloc._outer_optimizer, outer_optimizer)
+
+    def test_desloc_optimizer_sync_every_none_defaults_to_sync_every(self) -> None:
+        model = SimpleModel()
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+        manager = create_manager()
+        manager.should_commit.return_value = True
+
+        with DESLoc(
+            manager,
+            model,
+            optimizer,
+            sync_every=5,
+            optimizer_sync_every=None,
+        ) as desloc:
+            for _ in range(5):
+                self._train_step(model, optimizer)
+
+            # With optimizer_sync_every=None, the fallback is sync_every (5).
+            # After 5 steps the optimizer state keys should have been discovered
+            # and their sync frequency should equal sync_every.
+            for key, freq in desloc._optimizer_state_sync_every.items():
+                self.assertEqual(freq, 5)
+
+            # A quorum should have been started (params due at step 5).
+            self.assertGreaterEqual(manager.start_quorum.call_count, 1)
+            # Optimizer states should have been allreduced at step 5.
+            self.assertGreater(manager.allreduce.call_count, 0)
