@@ -6,6 +6,7 @@
 
 from torchft.data import DistributedSampler
 from torchft.ddp import DistributedDataParallel
+from torchft.local_sgd import OuterOptimizerConfig
 from torchft.manager import Manager
 from torchft.optim import OptimizerWrapper as Optimizer
 from torchft.otel import setup_logger
@@ -26,6 +27,7 @@ __all__ = (
     "DistributedSampler",
     "Manager",
     "Optimizer",
+    "OuterOptimizerConfig",
     "ProcessGroupNCCL",
     "ProcessGroupXCCL",
     "ProcessGroupBabyNCCL",
